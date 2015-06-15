@@ -1,97 +1,123 @@
-require 'socket'
-require 'uri'
+# Comments marked with a * are verbatim from the article or source. See README
 
-# Files will be served from this directory
+# Note: Python has a SocketServer.TCPServer class that would make this easier.
+# To stay closer to the original intention though, we are sticking with socket.
+from socket import socket, AF_INET, SOCK_STREAM
+from urlparse import urlparse
+from urllib import url2pathname
+import os.path
+
+#*Files will be served from this directory
 WEB_ROOT = './public'
 
-# Map extensions to their content type
+#*Map extensions to their content type
 CONTENT_TYPE_MAPPING = {
-  'html' => 'text/html',
-  'txt' => 'text/plain',
-  'png' => 'image/png',
-  'jpg' => 'image/jpeg'
-}
+    '.html': 'text/html',
+    '.txt':  'text/plain',
+    '.png':  'image/png',
+    '.jpg':  'image/jpeg'
+    }
 
-# Treat as binary data if content type cannot be found
+#*Treat as binary data if content type cannot be found
 DEFAULT_CONTENT_TYPE = 'application/octet-stream'
 
-# This helper function parses the extension of the
-# requested file and then looks up its content type.
+#*This helper function parses the extension of the requested file and then
+# looks up its content type.
+def content_type(path):
+    ext = os.path.splitext(path)[1]
+    return CONTENT_TYPE_MAPPING.get(ext, DEFAULT_CONTENT_TYPE)
 
-def content_type(path)
-  ext = File.extname(path).split(".").last
-  CONTENT_TYPE_MAPPING.fetch(ext, DEFAULT_CONTENT_TYPE)
-end
+#*This helper function parses the Request-Line and generates a path to a file
+# on the server.
+def requested_file(request_line):
+    request_uri = request_line.split(" ")[1]
+    # urlparse will provide us the path, url2pathname will decode characters
+    # and give us a path our local filesystem speaks (e.g. forward slashes on
+    # nix and backslashes on Windows).
+    path = url2pathname(urlparse(request_uri).path)
 
-# This helper function parses the Request-Line and
-# generates a path to a file on the server.
+    clean = []
 
-def requested_file(request_line)
-  request_uri  = request_line.split(" ")[1]
-  path         = URI.unescape(URI(request_uri).path)
+    parts = path.split("/")
+    for part in parts:
+        #*skip any empty or current directory (".") path components
+        if not part or part == '.':
+            continue
 
-  clean = []
+        #*If the path component goes up one directory (".."), remove the last
+        # clean component. Otherwise, add the component to the Array of clean
+        # components.
+        if part == '..':
+            clean.pop()
+        else:
+            clean.append(part)
 
-  # Split the path into components
-  parts = path.split("/")
+    return os.path.join(WEB_ROOT, *clean)
 
-  parts.each do |part|
-    # skip any empty or current directory (".") path components
-    next if part.empty? || part == '.'
-    # If the path component goes up one directory level (".."),
-    # remove the last clean component.
-    # Otherwise, add the component to the Array of clean components
-    part == '..' ? clean.pop : clean << part
-  end
+server = socket()
 
-  # return the web root joined to the clean path
-  File.join(WEB_ROOT, *clean)
-end
+# bind() takes an address tuple consisting of host and port.
+# This server will listen on localhost:2345 for incoming connections.
+server.bind(('localhost', 2345))
 
-# Except where noted below, the general approach of
-# handling requests and generating responses is
-# similar to that of the "Hello World" example
-# shown earlier.
+# We're only going to queue up to one connection. If other connections are
+# made while the server is processing another, it will not be "queued."
+server.listen(1)
 
-server = TCPServer.new('localhost', 2345)
+# As mentioned, we're only going to process one connection at a time, but we'll
+# keep doing this forever.
+while True:
+    try:
+        # Wait until a client connects. accept() gives us the address connecting to
+        # our socket server, as well as a socket object for this one connection.
+        connection, address = server.accept()
 
-loop do
-  socket       = server.accept
-  request_line = socket.gets
+        # Receive up to 1024 bytes from the socket that we just accepted a
+        # connection from.
+        request = connection.recv(1024)
+    except KeyboardInterrupt:
+        # When we terminate with Ctrl+C we need to close our server socket. If we
+        # don't, the operating system will think the address we bound to (from the
+        # bind() call) is still in use.
+        #
+        # The reason why the try/except block is _here_ is because the calls to
+        # accept() and recv() will "block" the program from continuing until
+        # they're complete. Thus without the try/except, any interrupt would be
+        # ignored.
+        connection.close()
+        break
 
-  STDERR.puts request_line
+    request_line = request.split("\n")[0]
 
-  path = requested_file(request_line)
-  path = File.join(path, 'index.html') if File.directory?(path)
+    # Print just the first line of the request (the Request-Line)
+    print '{}: {}'.format(address, request_line)
 
-  # Make sure the file exists and is not a directory
-  # before attempting to open it.
-  if File.exist?(path) && !File.directory?(path)
-    File.open(path, "rb") do |file|
-      socket.print "HTTP/1.1 200 OK\r\n" +
-                   "Content-Type: #{content_type(file)}\r\n" +
-                   "Content-Length: #{file.size}\r\n" +
-                   "Connection: close\r\n"
+    path = requested_file(request_line)
+    if os.path.isdir(path):
+        path = os.path.join(path, 'index.html')
 
-      socket.print "\r\n"
+    if os.path.isfile(path):
+        with open(path, 'rb') as file:
+            contents = file.read()
+            connection.sendall("HTTP/1.1 200 OK\r\n" +
+                               "Connection-Type: {}\r\n".format(content_type(path)) +
+                               "Content-Length: {}\r\n".format(len(contents)) +
+                               "Connection: close\r\n")
+            connection.sendall("\r\n")
+            connection.sendall(contents)
+    else:
+        message = "File not found\n"
 
-      # write the contents of the file to the socket
-      IO.copy_stream(file, socket)
-    end
-  else
-    message = "File not found\n"
+        #*respond with a 404 error code to indicate the file does not exist
+        connection.sendall("HTTP/1.1 404 Not Found\r\n" +
+                           "Connection-Type: text/plain\r\n" +
+                           "Content-Length: {}\r\n".format(len(message)) +
+                           "Connection: close\r\n")
+        connection.sendall("\r\n")
+        connection.sendall(message)
 
-    # respond with a 404 error code to indicate the file does not exist
-    socket.print "HTTP/1.1 404 Not Found\r\n" +
-                 "Content-Type: text/plain\r\n" +
-                 "Content-Length: #{message.size}\r\n" +
-                 "Connection: close\r\n"
+    # Close the socket we have a connection with.
+    connection.close()
 
-    socket.print "\r\n"
-
-    socket.print message
-  end
-
-  socket.close
-end
-
+print 'Closing socket server.'
+server.close()
